@@ -6,6 +6,7 @@ oracle.formula()
 oracle.context()
 """
 
+import os
 import random
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -75,7 +76,7 @@ class Oracle:
         return col
 
     def _train_all(self):
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        with ThreadPoolExecutor(max_workers=os.cpu_count()) as pool:
             futures = {pool.submit(self._train_one, col): col for col in self._columns}
             for future in as_completed(futures):
                 future.result()
