@@ -234,10 +234,15 @@ One call. Under 2000 tokens. The LLM now understands your data's structure AND t
 ## Install
 
 ```bash
-pip install monce
+git clone https://github.com/Monce-AI/oracle.git && cd oracle
+python -m venv .venv && source .venv/bin/activate
+pip install -e . pandas
+python example.py
 ```
 
-That's it. Snake ([algorithmeai](https://github.com/Monce-AI/algorithmeai-snake)) is bundled — zero external dependencies.
+Or one-liner: `./setup.sh`
+
+Snake ([algorithmeai](https://github.com/Monce-AI/algorithmeai-snake)) is bundled — zero external dependencies.
 
 ---
 
