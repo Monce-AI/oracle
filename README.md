@@ -1,7 +1,8 @@
 [![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-Proprietary-red.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/Rule_Discovery-10/10_passed-brightgreen.svg?logo=githubactions&logoColor=white)](#rule-discovery-test-suite)
-[![Titanic](https://img.shields.io/badge/Titanic-98.5%25_accuracy-blue.svg?logo=speedtest)](#titanic-showcase)
+[![Titanic](https://img.shields.io/badge/Titanic-99.9%25_accuracy-blue.svg?logo=speedtest)](#titanic-showcase)
+[![Speed](https://img.shields.io/badge/Constructor-<200ms-ff6600.svg?logo=zap&logoColor=white)](#progressive-engine)
 [![Built on](https://img.shields.io/badge/Built_on-algorithmeai--snake-blueviolet.svg)](https://github.com/Monce-AI/algorithmeai-snake)
 
 <p align="center">
