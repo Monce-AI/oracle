@@ -14,11 +14,19 @@
 
 ```python
 from monce import Oracle
+import pandas as pd
 
-oracle = Oracle(df)
-print(oracle.formula())    # discovered rules, ranked by statistical lift
-print(oracle.context())    # LLM-ready snippet: sample rows + formulas
+oracle = Oracle(pd.read_csv("train.csv"))
+print(oracle.formula())
 ```
+
+**Output:**
+
+| # | Formula | Lift | Evidence | Sig |
+|---|---------|------|----------|-----|
+| 1 | IF "Sex" does NOT contain "f" AND len("Name") >= 20.5 → **Survived** = 0 | 2.0x | acc=100%, n=42/891 | ★★ |
+| 2 | IF "Sex==male" > 0.5 AND "Pclass==3" > 0.5 → **Survived** = 1 | 2.0x | acc=100%, n=38/891 | ★★ |
+| 3 | IF digit_chars("Ticket") >= 5.5 → **Fare** ≈ 9.50 | 2.1x | n=483, IQR [7.85, 26.00] | ★★ |
 
 Feed it a DataFrame. It trains a Snake model on every column in parallel. Then ask it anything — predict, regress, explain, detect anomalies, fill gaps, discover the formulas governing your data.
 
@@ -30,23 +38,25 @@ Feed it a DataFrame. It trains a Snake model on every column in parallel. Then a
 import pandas as pd
 from monce import Oracle
 
-df = pd.read_csv("your_data.csv")
-oracle = Oracle(df, n_layers=5)
+oracle = Oracle(pd.read_csv("train.csv"))
 
-# Predict any column
-oracle.predict("churn", {"plan": "free", "months": 2, "tickets": 5})
+# Predict survival
+oracle.predict("Survived", {"Pclass": "1", "Sex": "female", "Age": "17", "SibSp": "1", "Parch": "1", "Fare": "512", "Embarked": "C"})
+# → 1 (survived), probability: {1: 0.90, 0: 0.10}
 
-# Regression on continuous columns
-oracle.regression("price", {"sqft": 1500, "beds": 3, "location": "downtown"})
+# Regression: what should this ticket cost?
+oracle.regression("Fare", {"Pclass": "3", "Sex": "male", "Age": "20", "SibSp": "0", "Parch": "0", "Survived": "0", "Embarked": "S"})
+# → 33.43
 
-# Distribution candle
-oracle.candle("price", {"sqft": 1500, "beds": 3, "location": "downtown"})
+# Full price distribution
+oracle.candle("Fare", {"Pclass": "3", "Sex": "male", "Age": "20", "SibSp": "0", "Parch": "0", "Survived": "0", "Embarked": "S"})
+# → Candle(high=71.28, q3=56.50, median=12.50, q1=7.43, low=0.0, mean=27.02, std=24.42)
 
-# Full explainable audit
-print(oracle.audit("churn", {"plan": "free", "months": 2, "tickets": 5}))
+# Discover survival rules
+print(oracle.formula(col="Survived"))
 
-# Discover formulas
-print(oracle.formula(col="churn"))
+# Discover fare pricing formulas
+print(oracle.formula(col="Fare"))
 
 # LLM context provider
 print(oracle.context())
