@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+titanic.csv
+ssh_key.txt
+algorithmeai-snake-main/
+.claude/

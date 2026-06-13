@@ -1,0 +1,15 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "monce"
+version = "0.1.0"
+description = "Question your data. Snake-powered DataFrame intelligence."
+requires-python = ">=3.9"
+license = "Proprietary"
+authors = [{name = "Charles Dana", email = "charles@monce.ai"}]
+dependencies = ["algorithmeai"]
+
+[project.urls]
+Homepage = "https://monce.ai"

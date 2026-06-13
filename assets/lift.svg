@@ -1,0 +1,45 @@
+<svg xmlns='http://www.w3.org/2000/svg' width='560' height='280' viewBox='0 0 560 280' font-family='-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif'>
+  <rect width='560' height='280' rx='14' fill='#ffffff'/>
+  <rect width='560' height='280' rx='14' fill='none' stroke='#e7e3f0' stroke-width='1.5'/>
+  <text x='28' y='38' font-size='19' font-weight='700' fill='#1a1730'>Lift — How Much Better Than Random</text>
+  <text x='28' y='58' font-size='13' fill='#6b6486'>Formula accuracy vs base rate (1.0x = random guessing)</text>
+
+  <!-- Axis -->
+  <line x1='60' y1='230' x2='530' y2='230' stroke='#e0e0e0' stroke-width='1'/>
+  <line x1='60' y1='80' x2='60' y2='230' stroke='#e0e0e0' stroke-width='1'/>
+
+  <!-- Baseline -->
+  <line x1='60' y1='200' x2='530' y2='200' stroke='#F44336' stroke-width='1' stroke-dasharray='4,4'/>
+  <text x='535' y='204' font-size='10' fill='#F44336'>1.0x (random)</text>
+
+  <!-- Bars -->
+  <rect x='90' y='100' width='40' height='130' rx='4' fill='#7B1FA2' opacity='0.85'/>
+  <text x='110' y='95' font-size='11' font-weight='600' fill='#7B1FA2' text-anchor='middle'>5.0x</text>
+  <text x='110' y='248' font-size='9' fill='#6b6486' text-anchor='middle'>beds</text>
+
+  <rect x='150' y='120' width='40' height='110' rx='4' fill='#7B1FA2' opacity='0.75'/>
+  <text x='170' y='115' font-size='11' font-weight='600' fill='#7B1FA2' text-anchor='middle'>3.0x</text>
+  <text x='170' y='248' font-size='9' fill='#6b6486' text-anchor='middle'>species</text>
+
+  <rect x='210' y='120' width='40' height='110' rx='4' fill='#7B1FA2' opacity='0.75'/>
+  <text x='230' y='115' font-size='11' font-weight='600' fill='#7B1FA2' text-anchor='middle'>3.0x</text>
+  <text x='230' y='248' font-size='9' fill='#6b6486' text-anchor='middle'>weather</text>
+
+  <rect x='270' y='140' width='40' height='90' rx='4' fill='#7B1FA2' opacity='0.65'/>
+  <text x='290' y='135' font-size='11' font-weight='600' fill='#7B1FA2' text-anchor='middle'>2.5x</text>
+  <text x='290' y='248' font-size='9' fill='#6b6486' text-anchor='middle'>salary</text>
+
+  <rect x='330' y='150' width='40' height='80' rx='4' fill='#7B1FA2' opacity='0.55'/>
+  <text x='350' y='145' font-size='11' font-weight='600' fill='#7B1FA2' text-anchor='middle'>2.0x</text>
+  <text x='350' y='248' font-size='9' fill='#6b6486' text-anchor='middle'>location</text>
+
+  <rect x='390' y='155' width='40' height='75' rx='4' fill='#7B1FA2' opacity='0.50'/>
+  <text x='410' y='150' font-size='11' font-weight='600' fill='#7B1FA2' text-anchor='middle'>1.8x</text>
+  <text x='410' y='248' font-size='9' fill='#6b6486' text-anchor='middle'>driving</text>
+
+  <!-- Legend -->
+  <rect x='440' y='90' width='12' height='12' rx='2' fill='#7B1FA2' opacity='0.85'/>
+  <text x='458' y='100' font-size='10' fill='#6b6486'>Higher = stronger rule</text>
+  <rect x='440' y='108' width='12' height='12' rx='2' fill='none' stroke='#F44336' stroke-width='1' stroke-dasharray='2,2'/>
+  <text x='458' y='118' font-size='10' fill='#6b6486'>Random baseline</text>
+</svg>
