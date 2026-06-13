@@ -2,13 +2,14 @@
 Oracle — question your data.
 from monce import Oracle
 oracle = Oracle(df)
+oracle.predict("Survived", row)   # instant, progressive accuracy
 oracle.formula()
-oracle.context()
 """
 
 import os
 import random
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from algorithmeai import Snake
 from .formula import (
@@ -19,8 +20,16 @@ from .formula import (
 )
 
 
+_TIERS = [
+    {"n_layers": 10, "bucket": 50},
+    {"n_layers": 20, "bucket": 150},
+    {"n_layers": 40, "bucket": 300},
+    {"n_layers": 80, "bucket": 500},
+]
+
+
 class Oracle:
-    def __init__(self, data, n_layers=5, bucket=250, noise=0.25, workers=1):
+    def __init__(self, data, noise=0.25, workers=1, budget=None):
         if hasattr(data, "to_dict"):
             self._records = data.to_dict(orient="records")
             self._columns = list(data.columns)
@@ -30,23 +39,25 @@ class Oracle:
         else:
             raise ValueError("Oracle accepts a DataFrame or list[dict]")
 
-        self._config = {
-            "n_layers": n_layers,
-            "bucket": bucket,
-            "noise": noise,
-            "workers": workers,
-        }
+        self._noise = noise
+        self._workers = workers
+        self._budget = budget
+        self._tier = 0
+        self._max_tier = len(_TIERS) if budget is None else min(budget, len(_TIERS))
 
         self.models = {}
         self._lock = threading.Lock()
         self._ready_count = 0
         self._total = len(self._columns)
         self._col_types = {}
+        self._training = True
+        self._tier_complete = threading.Event()
 
-        self._train_all()
+        self._thread = threading.Thread(target=self._train_loop, daemon=True)
+        self._thread.start()
+        self._tier_complete.wait()
 
     def _detect_col_type(self, col):
-        """Detect if column is classification or regression (continuous)."""
         values = [r[col] for r in self._records if col in r]
         if not values:
             return "classification"
@@ -59,31 +70,69 @@ class Oracle:
                 pass
         return "classification"
 
-    def _train_one(self, col):
-        col_type = self._detect_col_type(col)
-        model = Snake(
-            self._records,
-            target_index=col,
-            n_layers=self._config["n_layers"],
-            bucket=self._config["bucket"],
-            noise=self._config["noise"],
-            workers=self._config["workers"],
-        )
-        with self._lock:
-            self.models[col] = model
-            self._col_types[col] = col_type
-            self._ready_count += 1
-        return col
+    def _sample_for_tier(self, tier_idx):
+        if tier_idx == 0:
+            max_rows = 100
+            cols = self._select_columns(0)
+            source = self._records[:max_rows]
+            return [{k: r[k] for k in cols if k in r} for r in source]
+        else:
+            max_rows = min(len(self._records), _TIERS[tier_idx]["bucket"] * 4)
+        if len(self._records) <= max_rows:
+            return self._records
+        step = len(self._records) // max_rows
+        return self._records[::step][:max_rows]
 
-    def _train_all(self):
+    def _select_columns(self, tier_idx):
+        if tier_idx == 0:
+            fast_cols = []
+            for col in self._columns:
+                vals = [str(r.get(col, "")) for r in self._records[:100]]
+                n_unique = len(set(vals))
+                max_len = max((len(v) for v in vals), default=0)
+                if n_unique <= 20 and max_len <= 10:
+                    fast_cols.append(col)
+            return fast_cols[:10] if fast_cols else self._columns[:6]
+        return self._columns
+
+    def _train_tier(self, tier_idx):
+        tier = _TIERS[tier_idx]
+        records = self._sample_for_tier(tier_idx)
+        columns = self._select_columns(tier_idx)
+
+        def train_col(col):
+            col_type = self._detect_col_type(col)
+            model = Snake(
+                records,
+                target_index=col,
+                n_layers=tier["n_layers"],
+                bucket=tier["bucket"],
+                noise=self._noise,
+                workers=self._workers,
+            )
+            with self._lock:
+                self.models[col] = model
+                self._col_types[col] = col_type
+                self._ready_count = len(self.models)
+            return col
+
         with ThreadPoolExecutor(max_workers=os.cpu_count()) as pool:
-            futures = {pool.submit(self._train_one, col): col for col in self._columns}
-            for future in as_completed(futures):
-                future.result()
+            futures = [pool.submit(train_col, col) for col in columns]
+            for f in as_completed(futures):
+                f.result()
+
+    def _train_loop(self):
+        for tier_idx in range(self._max_tier):
+            self._train_tier(tier_idx)
+            self._tier = tier_idx + 1
+            self._tier_complete.set()
+        self._training = False
 
     def _require_model(self, col):
         if col not in self.models:
-            raise KeyError(f"No model for column '{col}' yet")
+            self._tier_complete.wait()
+        if col not in self.models:
+            raise KeyError(f"No model for column '{col}'")
         return self.models[col]
 
     def _features(self, row, col):
@@ -98,6 +147,14 @@ class Oracle:
     @property
     def total(self):
         return self._total
+
+    @property
+    def tier(self):
+        return self._tier
+
+    @property
+    def training(self):
+        return self._training
 
     # ─── Snake method wrappers ───
 
@@ -148,7 +205,6 @@ class Oracle:
         pairs = []
         for col, model in self.models.items():
             if self._col_types.get(col) == "regression":
-                # R² approximation via candle
                 values = [float(r[col]) for r in self._records if col in r]
                 mean_val = sum(values) / len(values) if values else 0
                 ss_tot = sum((v - mean_val) ** 2 for v in values)
@@ -282,7 +338,6 @@ class Oracle:
     def context(self, col=None):
         """
         LLM-ready snippet: sample rows + discovered formulas.
-        Designed to be injected into an LLM prompt for data understanding.
         """
         lines = []
         lines.append("## Dataset Context")
@@ -290,7 +345,6 @@ class Oracle:
         lines.append(f"Columns: {', '.join(self._columns)}")
         lines.append("")
 
-        # Sample rows
         lines.append("### Sample Rows")
         sample_indices = random.sample(range(len(self._records)), min(5, len(self._records)))
         sample = [self._records[i] for i in sample_indices]
@@ -303,14 +357,12 @@ class Oracle:
                 lines.append("| " + " | ".join(vals) + " |")
         lines.append("")
 
-        # Column types
         lines.append("### Column Types")
         for c in self._columns:
             ct = self._col_types.get(c, "unknown")
             lines.append(f"- **{c}**: {ct}")
         lines.append("")
 
-        # Top formulas
         lines.append("### Discovered Formulas")
         formula_md = self.formula(col=col, top_n=8)
         if formula_md:
@@ -321,4 +373,5 @@ class Oracle:
         return "\n".join(lines)
 
     def __repr__(self):
-        return f"Oracle({self._ready_count}/{self._total} models ready, {len(self._records)} rows)"
+        status = "training" if self._training else "ready"
+        return f"Oracle(tier={self._tier}/{self._max_tier} {status}, {len(self._records)} rows)"
