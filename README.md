@@ -227,7 +227,7 @@ One call. Under 2000 tokens. The LLM now understands your data's structure AND t
 pip install monce
 ```
 
-Requires: `algorithmeai` (Snake classifier, zero external dependencies).
+That's it. Snake ([algorithmeai](https://github.com/Monce-AI/algorithmeai-snake)) is bundled — zero external dependencies.
 
 ---
 
