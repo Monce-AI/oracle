@@ -518,7 +518,10 @@ class Oracle:
                     except (ValueError, TypeError, KeyError):
                         continue
                     features = self._features(record, c)
-                    pred = model.get_regression(features)
+                    try:
+                        pred = model.get_regression(features)
+                    except (TypeError, ValueError, KeyError):
+                        continue
                     values.append(actual)
                     preds.append(pred)
                 if len(values) < 2:
@@ -533,10 +536,13 @@ class Oracle:
                 correct = 0
                 total = 0
                 for record in self._records:
-                    if c not in record:
+                    if c not in record or record[c] == "":
                         continue
                     features = self._features(record, c)
-                    pred = model.get_prediction(features)
+                    try:
+                        pred = model.get_prediction(features)
+                    except (TypeError, ValueError, KeyError):
+                        continue
                     if str(pred) == str(record[c]):
                         correct += 1
                     total += 1
@@ -649,6 +655,261 @@ class Oracle:
                     break
 
         return " ".join(parts)
+
+    # ─── Features (ranked feature importance) ───
+
+    def features(self, col=None, top_n=20):
+        """Ranked feature importance for a target column.
+        Returns list of dicts: {feature, mi, direction, type, rank}."""
+        col = self._resolve_col(col)
+        if col not in self.models:
+            raise KeyError(f"No model for column '{col}'")
+
+        model = self.models[col]
+        n = len(self._records)
+
+        # Get MI from Snake's internal computation
+        raw_mi = {}
+        for feat_idx, mi_val in model._feature_mi.items():
+            if feat_idx < len(model.header):
+                feat_name = model.header[feat_idx]
+                if feat_name != col:
+                    raw_mi[feat_name] = mi_val
+
+        # Compute direction (correlation sign) for each feature
+        results = []
+        target_vals = [str(r.get(col, "")) for r in self._records if col in r]
+        is_target_numeric = self._col_types.get(col) == "regression"
+
+        if is_target_numeric:
+            target_numeric = []
+            for r in self._records:
+                try:
+                    target_numeric.append(float(r[col]))
+                except (ValueError, TypeError, KeyError):
+                    target_numeric.append(None)
+
+        for feat_name, mi_val in sorted(raw_mi.items(), key=lambda x: -x[1]):
+            if mi_val <= 0:
+                continue
+
+            # Determine feature type
+            feat_stats = self._col_stats.get(feat_name, {})
+            feat_type = feat_stats.get("type", "unknown")
+
+            # Compute direction
+            direction = "+"
+            if is_target_numeric and feat_type == "regression":
+                # Pearson sign between two numeric columns
+                feat_numeric = []
+                tgt_paired = []
+                for r in self._records:
+                    try:
+                        fv = float(r.get(feat_name, ""))
+                        tv = float(r.get(col, ""))
+                        feat_numeric.append(fv)
+                        tgt_paired.append(tv)
+                    except (ValueError, TypeError):
+                        continue
+                if len(feat_numeric) > 2:
+                    f_mean = sum(feat_numeric) / len(feat_numeric)
+                    t_mean = sum(tgt_paired) / len(tgt_paired)
+                    cov = sum((f - f_mean) * (t - t_mean) for f, t in zip(feat_numeric, tgt_paired))
+                    direction = "+" if cov >= 0 else "-"
+            elif not is_target_numeric and feat_type == "regression":
+                # Numeric feature predicting a class — check if higher = more of majority class
+                majority = Counter(target_vals).most_common(1)[0][0]
+                vals_majority = []
+                vals_minority = []
+                for r in self._records:
+                    try:
+                        fv = float(r.get(feat_name, ""))
+                    except (ValueError, TypeError):
+                        continue
+                    if str(r.get(col, "")) == majority:
+                        vals_majority.append(fv)
+                    else:
+                        vals_minority.append(fv)
+                if vals_majority and vals_minority:
+                    mean_maj = sum(vals_majority) / len(vals_majority)
+                    mean_min = sum(vals_minority) / len(vals_minority)
+                    direction = "+" if mean_maj >= mean_min else "-"
+
+            results.append({
+                "feature": feat_name,
+                "mi": round(mi_val, 4),
+                "direction": direction,
+                "type": feat_type,
+            })
+
+            if len(results) >= top_n:
+                break
+
+        for i, r in enumerate(results):
+            r["rank"] = i + 1
+
+        return results
+
+    # ─── Validate (multi-seed robustness) ───
+
+    def validate(self, col=None, seeds=10, test_ratio=0.2):
+        """Multi-seed train/test validation. Returns accuracy/R² distribution
+        across N random splits. Shows robustness, not just one lucky split."""
+        col = self._resolve_col(col)
+        col_type = self._col_types.get(col, "classification")
+        n = len(self._records)
+        test_size = max(2, int(n * test_ratio))
+
+        # Get current tier config
+        if self._tiers:
+            tier = self._tiers[-1]
+        else:
+            tier = _TIERS[0]
+
+        scores = []
+        for seed in range(seeds):
+            rng = random.Random(seed)
+            indices = list(range(n))
+            rng.shuffle(indices)
+            train_idx = indices[test_size:]
+            test_idx = indices[:test_size]
+
+            train_records = [self._records[i] for i in train_idx]
+            test_records = [self._records[i] for i in test_idx]
+
+            try:
+                model = Snake(
+                    train_records,
+                    target_index=col,
+                    n_layers=tier["n_layers"],
+                    bucket=min(tier["bucket"], len(train_records)),
+                    noise=self._noise,
+                    workers=self._workers,
+                )
+            except Exception:
+                continue
+
+            if col_type == "regression":
+                ss_tot = 0.0
+                ss_res = 0.0
+                values = []
+                for record in test_records:
+                    try:
+                        actual = float(record[col])
+                    except (ValueError, TypeError, KeyError):
+                        continue
+                    features = {k: v for k, v in record.items() if k != col}
+                    try:
+                        pred = model.get_regression(features)
+                    except (TypeError, ValueError, KeyError):
+                        continue
+                    values.append(actual)
+                    ss_res += (actual - pred) ** 2
+                if len(values) < 2:
+                    continue
+                mean_val = sum(values) / len(values)
+                ss_tot = sum((v - mean_val) ** 2 for v in values)
+                r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+                scores.append(r2)
+            else:
+                correct = 0
+                total = 0
+                for record in test_records:
+                    if col not in record or record[col] == "":
+                        continue
+                    features = {k: v for k, v in record.items() if k != col}
+                    try:
+                        pred = model.get_prediction(features)
+                    except (TypeError, ValueError, KeyError):
+                        continue
+                    if str(pred) == str(record[col]):
+                        correct += 1
+                    total += 1
+                if total > 0:
+                    scores.append(correct / total)
+
+        if not scores:
+            return {"col": col, "type": col_type, "seeds": seeds, "scores": [],
+                    "mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0, "robust": False}
+
+        mean_score = statistics.mean(scores)
+        std_score = statistics.stdev(scores) if len(scores) > 1 else 0.0
+
+        # Robust = low variance across seeds AND above baseline
+        if col_type == "classification":
+            n_classes = len(set(str(r.get(col, "")) for r in self._records if col in r))
+            baseline = 1.0 / n_classes if n_classes > 0 else 0.5
+        else:
+            baseline = 0.0
+
+        robust = std_score < 0.1 and mean_score > baseline + 0.1
+
+        return {
+            "col": col,
+            "type": col_type,
+            "seeds": len(scores),
+            "scores": [round(s, 4) for s in scores],
+            "mean": round(mean_score, 4),
+            "std": round(std_score, 4),
+            "min": round(min(scores), 4),
+            "max": round(max(scores), 4),
+            "robust": robust,
+        }
+
+    # ─── Signal Map ───
+
+    def signal_map(self):
+        """Per-column signal assessment. Returns a list of dicts showing where
+        Oracle has real signal vs where it's at noise level.
+        Uses validate() internally — honest held-out performance."""
+        results = []
+        for col in self._columns:
+            if col not in self.models:
+                continue
+            col_type = self._col_types.get(col, "classification")
+
+            # Quick held-out check (3 seeds for speed)
+            v = self.validate(col=col, seeds=3, test_ratio=0.25)
+
+            if col_type == "classification":
+                n_classes = len(set(str(r.get(col, "")) for r in self._records if col in r and r[col] != ""))
+                baseline = 1.0 / n_classes if n_classes > 0 else 0.5
+                metric = v["mean"]
+                metric_name = "accuracy"
+                # Signal strength classification
+                if metric >= 0.95:
+                    signal = "strong"
+                elif metric >= baseline + 0.15:
+                    signal = "moderate"
+                elif metric >= baseline + 0.05:
+                    signal = "weak"
+                else:
+                    signal = "noise"
+            else:
+                baseline = 0.0
+                metric = v["mean"]
+                metric_name = "r2"
+                if metric >= 0.7:
+                    signal = "strong"
+                elif metric >= 0.3:
+                    signal = "moderate"
+                elif metric >= 0.1:
+                    signal = "weak"
+                else:
+                    signal = "noise"
+
+            results.append({
+                "column": col,
+                "type": col_type,
+                "metric": metric_name,
+                "score": round(metric, 4),
+                "baseline": round(baseline, 4),
+                "signal": signal,
+                "std": v["std"],
+            })
+
+        results.sort(key=lambda x: -x["score"])
+        return results
 
     def __repr__(self):
         status = "training" if self._training else "ready"
