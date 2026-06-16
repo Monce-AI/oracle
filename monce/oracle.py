@@ -7,9 +7,12 @@ oracle.formula()
 """
 
 import os
+import math
 import random
+import statistics
 import threading
 import time
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from algorithmeai import Snake
 from .formula import (
@@ -29,7 +32,8 @@ _TIERS = [
 
 
 class Oracle:
-    def __init__(self, data, noise=0.25, workers=1, budget=None):
+    def __init__(self, data, noise=0.25, workers=1, budget=None,
+                 n_layers=None, bucket=None, columns=None, target=None):
         if hasattr(data, "to_dict"):
             self._records = data.to_dict(orient="records")
             self._columns = list(data.columns)
@@ -39,52 +43,102 @@ class Oracle:
         else:
             raise ValueError("Oracle accepts a DataFrame or list[dict]")
 
+        if columns:
+            self._columns = [c for c in columns if c in self._columns]
+            self._records = [{k: r[k] for k in self._columns if k in r} for r in self._records]
+
+        self._target = target
         self._noise = noise
         self._workers = workers
         self._budget = budget
+        self._errors = []
+
+        if n_layers or bucket:
+            self._tiers = [{"n_layers": n_layers or 20, "bucket": bucket or 150}]
+        else:
+            self._tiers = _TIERS
+
         self._tier = 0
-        self._max_tier = len(_TIERS) if budget is None else min(budget, len(_TIERS))
+        self._max_tier = len(self._tiers) if budget is None else min(budget, len(self._tiers))
 
         self.models = {}
         self._lock = threading.Lock()
         self._ready_count = 0
         self._total = len(self._columns)
         self._col_types = {}
+        self._col_stats = {}
         self._training = True
         self._tier_complete = threading.Event()
+
+        self._compute_stats()
 
         self._thread = threading.Thread(target=self._train_loop, daemon=True)
         self._thread.start()
         self._tier_complete.wait()
 
+    def _compute_stats(self):
+        for col in self._columns:
+            values = [r[col] for r in self._records if col in r and r[col] != ""]
+            if not values:
+                continue
+            str_values = [str(v) for v in values]
+            n_unique = len(set(str_values))
+            n_total = len(values)
+
+            numeric_values = []
+            for v in values:
+                try:
+                    numeric_values.append(float(v))
+                except (ValueError, TypeError):
+                    pass
+
+            is_numeric = len(numeric_values) > n_total * 0.8
+            is_regression = is_numeric and n_unique > min(20, n_total * 0.5)
+
+            stats = {
+                "n_total": n_total,
+                "n_unique": n_unique,
+                "n_missing": len(self._records) - n_total,
+                "type": "regression" if is_regression else "classification",
+            }
+
+            if is_numeric and numeric_values:
+                stats["min"] = min(numeric_values)
+                stats["max"] = max(numeric_values)
+                stats["mean"] = statistics.mean(numeric_values)
+                stats["median"] = statistics.median(numeric_values)
+                if len(numeric_values) > 1:
+                    stats["std"] = statistics.stdev(numeric_values)
+                else:
+                    stats["std"] = 0.0
+            else:
+                counter = Counter(str_values)
+                stats["top_values"] = counter.most_common(10)
+                stats["base_rate"] = counter.most_common(1)[0][1] / n_total if n_total else 0
+
+            self._col_stats[col] = stats
+            self._col_types[col] = stats["type"]
+
     def _detect_col_type(self, col):
-        values = [r[col] for r in self._records if col in r]
-        if not values:
-            return "classification"
-        n_unique = len(set(str(v) for v in values))
-        if n_unique > min(20, len(values) * 0.5):
-            try:
-                [float(v) for v in values[:20]]
-                return "regression"
-            except (ValueError, TypeError):
-                pass
-        return "classification"
+        return self._col_types.get(col, "classification")
 
     def _sample_for_tier(self, tier_idx):
-        if tier_idx == 0:
+        tier = self._tiers[tier_idx]
+        if tier_idx == 0 and len(self._tiers) > 1:
             max_rows = 100
             cols = self._select_columns(0)
             source = self._records[:max_rows]
-            return [{k: r[k] for k in cols if k in r} for r in source]
+            return [{k: r[k] for k in cols if k in r} for r in source], cols
         else:
-            max_rows = min(len(self._records), _TIERS[tier_idx]["bucket"] * 4)
+            max_rows = min(len(self._records), tier["bucket"] * 4)
+        cols = self._select_columns(tier_idx)
         if len(self._records) <= max_rows:
-            return self._records
+            return self._records, cols
         step = len(self._records) // max_rows
-        return self._records[::step][:max_rows]
+        return self._records[::step][:max_rows], cols
 
     def _select_columns(self, tier_idx):
-        if tier_idx == 0:
+        if tier_idx == 0 and len(self._tiers) > 1:
             fast_cols = []
             for col in self._columns:
                 vals = [str(r.get(col, "")) for r in self._records[:100]]
@@ -96,9 +150,8 @@ class Oracle:
         return self._columns
 
     def _train_tier(self, tier_idx):
-        tier = _TIERS[tier_idx]
-        records = self._sample_for_tier(tier_idx)
-        columns = self._select_columns(tier_idx)
+        tier = self._tiers[tier_idx]
+        records, columns = self._sample_for_tier(tier_idx)
 
         def train_col(col):
             col_type = self._detect_col_type(col)
@@ -117,16 +170,27 @@ class Oracle:
             return col
 
         with ThreadPoolExecutor(max_workers=os.cpu_count()) as pool:
-            futures = [pool.submit(train_col, col) for col in columns]
+            futures = {pool.submit(train_col, col): col for col in columns}
             for f in as_completed(futures):
-                f.result()
+                try:
+                    f.result()
+                except Exception as e:
+                    col = futures[f]
+                    with self._lock:
+                        self._errors.append((tier_idx, col, str(e)))
 
     def _train_loop(self):
-        for tier_idx in range(self._max_tier):
-            self._train_tier(tier_idx)
-            self._tier = tier_idx + 1
+        try:
+            for tier_idx in range(self._max_tier):
+                self._train_tier(tier_idx)
+                self._tier = tier_idx + 1
+                self._tier_complete.set()
+        except Exception as e:
+            with self._lock:
+                self._errors.append((-1, "loop", str(e)))
             self._tier_complete.set()
-        self._training = False
+        finally:
+            self._training = False
 
     def _require_model(self, col):
         if col not in self.models:
@@ -158,28 +222,59 @@ class Oracle:
 
     # ─── Snake method wrappers ───
 
-    def predict(self, col, features):
+    def _resolve_col(self, col):
+        if col is None:
+            if self._target:
+                return self._target
+            raise ValueError("No target column set. Pass col= or set target= in constructor.")
+        return col
+
+    def predict(self, col=None, features=None, **kwargs):
+        col = self._resolve_col(col)
+        if features is None:
+            features = kwargs
         return self._require_model(col).get_prediction(features)
 
-    def probability(self, col, features):
+    def probability(self, col=None, features=None, **kwargs):
+        col = self._resolve_col(col)
+        if features is None:
+            features = kwargs
         return self._require_model(col).get_probability(features)
 
-    def regression(self, col, features):
+    def regression(self, col=None, features=None, **kwargs):
+        col = self._resolve_col(col)
+        if features is None:
+            features = kwargs
         return self._require_model(col).get_regression(features)
 
-    def candle(self, col, features):
+    def candle(self, col=None, features=None, **kwargs):
+        col = self._resolve_col(col)
+        if features is None:
+            features = kwargs
         return self._require_model(col).get_candle(features)
 
-    def audit(self, col, features):
+    def audit(self, col=None, features=None, **kwargs):
+        col = self._resolve_col(col)
+        if features is None:
+            features = kwargs
         return self._require_model(col).get_audit(features)
 
-    def lookalikes(self, col, features):
+    def lookalikes(self, col=None, features=None, **kwargs):
+        col = self._resolve_col(col)
+        if features is None:
+            features = kwargs
         return self._require_model(col).get_lookalikes(features)
 
-    def lookalikes_labeled(self, col, features):
+    def lookalikes_labeled(self, col=None, features=None, **kwargs):
+        col = self._resolve_col(col)
+        if features is None:
+            features = kwargs
         return self._require_model(col).get_lookalikes_labeled(features)
 
-    def augmented(self, col, features):
+    def augmented(self, col=None, features=None, **kwargs):
+        col = self._resolve_col(col)
+        if features is None:
+            features = kwargs
         return self._require_model(col).get_augmented(features)
 
     # ─── Intelligence methods ───
@@ -333,21 +428,89 @@ class Oracle:
             lines.append(f"- {r.formula_text}  \n  `coverage={r.coverage}`")
         return "\n".join(lines)
 
+    # ─── Score ───
+
+    def score(self, col=None):
+        col = self._resolve_col(col) if col else None
+        targets = [col] if col else list(self.models.keys())
+        results = {}
+        for c in targets:
+            if c not in self.models:
+                continue
+            model = self.models[c]
+            if self._col_types.get(c) == "regression":
+                values = []
+                preds = []
+                for record in self._records:
+                    try:
+                        actual = float(record[c])
+                    except (ValueError, TypeError, KeyError):
+                        continue
+                    features = self._features(record, c)
+                    pred = model.get_regression(features)
+                    values.append(actual)
+                    preds.append(pred)
+                if len(values) < 2:
+                    results[c] = {"type": "regression", "r2": 0.0, "n": 0}
+                    continue
+                mean_val = sum(values) / len(values)
+                ss_tot = sum((v - mean_val) ** 2 for v in values)
+                ss_res = sum((a - p) ** 2 for a, p in zip(values, preds))
+                r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+                results[c] = {"type": "regression", "r2": round(r2, 4), "n": len(values)}
+            else:
+                correct = 0
+                total = 0
+                for record in self._records:
+                    if c not in record:
+                        continue
+                    features = self._features(record, c)
+                    pred = model.get_prediction(features)
+                    if str(pred) == str(record[c]):
+                        correct += 1
+                    total += 1
+                acc = correct / total if total else 0
+                results[c] = {"type": "classification", "accuracy": round(acc, 4), "n": total}
+        if col and col in results:
+            return results[col]
+        return results
+
     # ─── Context ───
 
     def context(self, col=None):
-        """
-        LLM-ready snippet: sample rows + discovered formulas.
-        """
         lines = []
         lines.append("## Dataset Context")
         lines.append(f"**{len(self._records)} rows × {len(self._columns)} columns**")
-        lines.append(f"Columns: {', '.join(self._columns)}")
         lines.append("")
 
+        # Column descriptions
+        lines.append("### Columns")
+        for c in self._columns:
+            stats = self._col_stats.get(c, {})
+            ct = stats.get("type", "unknown")
+            n_unique = stats.get("n_unique", "?")
+            n_missing = stats.get("n_missing", 0)
+            desc = f"- **{c}** ({ct})"
+            if ct == "regression":
+                mn = stats.get("min", "?")
+                mx = stats.get("max", "?")
+                mean = stats.get("mean", "?")
+                desc += f" — range [{mn}, {mx}], mean={mean:.1f}" if isinstance(mean, float) else ""
+            else:
+                top = stats.get("top_values", [])
+                if top:
+                    top_str = ", ".join(f"{v}({n})" for v, n in top[:5])
+                    desc += f" — {n_unique} unique: {top_str}"
+            if n_missing > 0:
+                desc += f" [{n_missing} missing]"
+            lines.append(desc)
+        lines.append("")
+
+        # Sample rows
         lines.append("### Sample Rows")
-        sample_indices = random.sample(range(len(self._records)), min(5, len(self._records)))
-        sample = [self._records[i] for i in sample_indices]
+        n_sample = min(5, len(self._records))
+        step = max(1, len(self._records) // n_sample)
+        sample = self._records[::step][:n_sample]
         if sample:
             headers = list(sample[0].keys())
             lines.append("| " + " | ".join(headers) + " |")
@@ -357,20 +520,64 @@ class Oracle:
                 lines.append("| " + " | ".join(vals) + " |")
         lines.append("")
 
-        lines.append("### Column Types")
-        for c in self._columns:
-            ct = self._col_types.get(c, "unknown")
-            lines.append(f"- **{c}**: {ct}")
+        # Predictability
+        lines.append("### Predictability")
+        scores = self.score()
+        if isinstance(scores, dict) and "type" not in scores:
+            for c, s in sorted(scores.items(), key=lambda x: -list(x[1].values())[1] if len(x[1]) > 1 else 0):
+                if s["type"] == "regression":
+                    lines.append(f"- **{c}**: R²={s['r2']:.3f}")
+                else:
+                    lines.append(f"- **{c}**: accuracy={s['accuracy']:.1%}")
         lines.append("")
 
-        lines.append("### Discovered Formulas")
+        # Formulas
+        lines.append("### Discovered Rules")
         formula_md = self.formula(col=col, top_n=8)
-        if formula_md:
+        if formula_md and "No significant" not in formula_md:
             lines.append(formula_md)
         else:
             lines.append("_No significant formulas discovered._")
+        lines.append("")
+
+        # Human summary
+        lines.append("### Summary")
+        lines.append(self._human_summary(col))
 
         return "\n".join(lines)
+
+    def _human_summary(self, col=None):
+        parts = []
+        n = len(self._records)
+        parts.append(f"This dataset has {n} records across {len(self._columns)} fields.")
+
+        # Strongest predictors
+        scores = self.score()
+        if isinstance(scores, dict) and "type" not in scores:
+            strong = [(c, s) for c, s in scores.items()
+                      if (s["type"] == "classification" and s.get("accuracy", 0) > 0.8)
+                      or (s["type"] == "regression" and s.get("r2", 0) > 0.7)]
+            if strong:
+                descs = []
+                for c, s in strong[:3]:
+                    if s["type"] == "classification":
+                        descs.append(f"'{c}' is predictable at {s['accuracy']:.0%}")
+                    else:
+                        descs.append(f"'{c}' is explained (R²={s['r2']:.2f})")
+                parts.append(" ".join(descs) + ".")
+
+        # Key relationships
+        for c in self._columns:
+            stats = self._col_stats.get(c, {})
+            if stats.get("type") == "classification":
+                top = stats.get("top_values", [])
+                if top and len(top) == 2:
+                    v1, n1 = top[0]
+                    v2, n2 = top[1]
+                    parts.append(f"'{c}' is binary: {v1} ({n1}/{n}), {v2} ({n2}/{n}).")
+                    break
+
+        return " ".join(parts)
 
     def __repr__(self):
         status = "training" if self._training else "ready"
