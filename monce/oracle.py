@@ -47,6 +47,7 @@ class Oracle:
             self._columns = [c for c in columns if c in self._columns]
             self._records = [{k: r[k] for k in self._columns if k in r} for r in self._records]
 
+        self._max_columns = 50
         self._target = target
         self._noise = noise
         self._workers = workers
@@ -71,6 +72,11 @@ class Oracle:
         self._tier_complete = threading.Event()
 
         self._compute_stats()
+
+        if len(self._columns) > self._max_columns:
+            self._columns = self._mi_filter_columns(self._max_columns)
+
+        self._total = len(self._columns)
 
         self._thread = threading.Thread(target=self._train_loop, daemon=True)
         self._thread.start()
@@ -118,6 +124,71 @@ class Oracle:
 
             self._col_stats[col] = stats
             self._col_types[col] = stats["type"]
+
+    def _mi_filter_columns(self, max_cols):
+        """Shannon MI column filter. Computes pairwise MI(col; target) directly
+        from the joint histogram, with bias correction for cardinality.
+        Runs in O(n * k^2) — fast, no model training needed."""
+        n = min(len(self._records), 500)
+        col_mi_scores = defaultdict(float)
+
+        # Pick scout targets: the target col + up to 9 low-cardinality classification cols
+        scout_targets = []
+        if self._target and self._target in self._columns:
+            scout_targets.append(self._target)
+        for c in self._columns:
+            if c not in scout_targets:
+                stats = self._col_stats.get(c, {})
+                if stats.get("type") == "classification" and stats.get("n_unique", 999) <= 20:
+                    scout_targets.append(c)
+            if len(scout_targets) >= 10:
+                break
+        if not scout_targets:
+            scout_targets = self._columns[:5]
+
+        records = self._records[:n]
+
+        for target_col in scout_targets:
+            target_vals = [str(r.get(target_col, "")) for r in records]
+            target_counts = Counter(target_vals)
+            k_target = len(target_counts)
+
+            for feat_col in self._columns:
+                if feat_col == target_col:
+                    continue
+
+                feat_vals = [str(r.get(feat_col, "")) for r in records]
+                feat_counts = Counter(feat_vals)
+                k_feat = len(feat_counts)
+
+                # Joint histogram
+                joint = Counter(zip(feat_vals, target_vals))
+
+                # MI = sum p(x,y) * log(p(x,y) / (p(x)*p(y)))
+                mi = 0.0
+                for (fv, tv), count in joint.items():
+                    p_xy = count / n
+                    p_x = feat_counts[fv] / n
+                    p_y = target_counts[tv] / n
+                    if p_xy > 0 and p_x > 0 and p_y > 0:
+                        mi += p_xy * math.log2(p_xy / (p_x * p_y))
+
+                # Bias correction: E[MI] under independence ~ (k_feat-1)(k_target-1) / (2*n*ln2)
+                bias = (k_feat - 1) * (k_target - 1) / (2.0 * n * math.log(2))
+                mi_corrected = max(0.0, mi - bias)
+
+                col_mi_scores[feat_col] += mi_corrected
+                col_mi_scores[target_col] += mi_corrected
+
+        ranked = sorted(self._columns, key=lambda c: col_mi_scores.get(c, 0.0), reverse=True)
+
+        if self._target and self._target in self._columns:
+            if self._target not in ranked[:max_cols]:
+                ranked = [self._target] + [c for c in ranked if c != self._target]
+
+        kept = ranked[:max_cols]
+        self._mi_scores = {c: col_mi_scores.get(c, 0.0) for c in kept}
+        return kept
 
     def _detect_col_type(self, col):
         return self._col_types.get(col, "classification")
